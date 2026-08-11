@@ -1,0 +1,1166 @@
+"""
+완전 로컬 데모 앱 - 외부 API 를 하나도 부르지 않는다.
+
+무엇이 GPU 에 올라가나 (전부 프로세스당 한 번, lru_cache):
+
+    1   질의 임베딩    BAAI/bge-m3              약 2.3GB
+    2   리랭킹        bge-reranker-v2-m3       약 1.1GB
+    4   답변 생성      Qwen/Qwen3-4B            bf16 약 8GB
+                                               ------------------------
+                                               합계 약 11.4GB
+
+LLM 은 LOCAL_LLM_MODEL 환경변수로 바꾼다 (예: Qwen/Qwen3-8B, 합계 약 19GB).
+모듈 import 시점에 읽으므로 아래 명령을 실행하기 전에 설정해야 한다. 화면의
+모델 이름·크기는 그 값에서 뽑으므로 따로 고칠 곳이 없다.
+
+    streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+"""
+
+import re
+import sys
+from html import escape
+from pathlib import Path
+
+import streamlit as st
+
+# src/ 를 임포트 경로에 넣는다 (앱은 프로젝트 루트에서 실행한다)
+ROOT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT_DIR / "src"))
+from corpus import ALL_DOCS, documents  # noqa: E402
+from embed import CHUNK_SIZE, OVERLAP, read_source  # noqa: E402
+from grade import find_question, load_questions  # noqa: E402
+from main import PipelineResult, run_pipeline  # noqa: E402
+from local_llm import DEFAULT_MODEL as LLM_MODEL  # noqa: E402
+from rerank_gpu import DEFAULT_MODEL as RERANKER_MODEL  # noqa: E402
+from search import DEFAULT_MODEL as EMBED_MODEL  # noqa: E402
+
+# 화면에 쓸 짧은 이름과 어림 크기. LOCAL_LLM_MODEL 을 바꿔도 표시가 따라오게
+# 하드코딩하지 않고 모델 이름에서 뽑는다.
+#   "Qwen/Qwen3-4B" -> "Qwen3-4B", "약 8GB"  (bf16 = 파라미터 수 x 2바이트)
+LLM_SHORT = LLM_MODEL.split("/")[-1]
+_params = re.search(r"(\d+(?:\.\d+)?)B", LLM_SHORT)
+LLM_SIZE = f"약 {float(_params.group(1)) * 2:.0f}GB" if _params else "크기 미상"
+
+EMBED_SHORT = EMBED_MODEL.split("/")[-1]
+RERANKER_SHORT = RERANKER_MODEL.split("/")[-1]
+
+
+# ---------------------------------------------------------
+# 기본 설정
+# ---------------------------------------------------------
+# set_page_config 는 다른 st.* 호출보다 반드시 먼저 와야 한다.
+# (제목은 스타일이 주입된 뒤 아래 "화면" 절에서 그린다)
+st.set_page_config(
+    page_title="문서 AI 모델 데모 (GPU)",
+    page_icon="🔎",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+
+# ---------------------------------------------------------
+# 선택 항목
+#
+# 질문은 data/qa.json, 문서는 data/emb 에서 읽는다. 앱에는 목록을 적어 두지
+# 않는다. 문서나 질문을 늘려도 코드를 고칠 일이 없게 하려는 것이다.
+# ---------------------------------------------------------
+DOCUMENTS = documents()
+
+# 화면에 보일 이름 -> 파이프라인에 넘길 문서 키. 첫 항목이 기본값이다.
+# 전체 검색이 기본인 이유: 질문만 던지면 7개 문서 중 어디에 답이 있는지 모델이
+# 찾아내는 편이 데모로서 정직하다.
+DOCUMENT_OPTIONS = {f"전체 문서 {len(DOCUMENTS)}종": ALL_DOCS}
+DOCUMENT_OPTIONS.update({doc.label: doc.key for doc in DOCUMENTS})
+
+QUESTIONS = load_questions()
+QUESTION_OPTIONS = [q.label for q in QUESTIONS]
+
+PIPELINE_STEPS = [
+    "검색 랭킹",
+    "리랭킹",
+    "최종 청크 선정",
+    "LLM 답변",
+    "정답 비교",
+]
+
+
+# ---------------------------------------------------------
+# 카드 그리기
+#
+# 파이프라인이 단계를 끝낼 때마다 하나씩 불린다. 각 함수는 st.markdown 한 번으로
+# 카드 하나를 그리고 끝낸다. 계산은 하지 않는다.
+# ---------------------------------------------------------
+
+def render_search(sr) -> None:
+    """1. 검색 랭킹 — 질문을 임베딩해 뽑은 상위 청크. 한 항목이 정확히 한 줄."""
+    if sr.hits:
+        items = "".join(
+            f'<div class="hit-line">'
+            f'<span class="hit-rank">{rank}</span>'
+            f'<span class="hit-score">{hit.score:.3f}</span>'
+            f'<span class="hit-src">{hit.key}</span>'
+            f'<span class="hit-oneline">{escape(hit.preview(220))}</span>'
+            f'</div>'
+            for rank, hit in enumerate(sr.hits, 1)
+        )
+    else:
+        items = '<div class="query-note">검색된 청크가 없습니다.</div>'
+    st.markdown(
+        f"""
+        <div class="result-card">
+            <div class="card-title">1. 검색 랭킹
+                <span class="tag">{escape(sr.doc_label)}</span>
+                <span class="tag">청크 {sr.n_indexed}개 → 상위 {sr.top_k}개</span>
+                <span class="tag">{sr.elapsed:.1f}초</span></div>
+            <div class="query-origin">질의 · {escape(sr.query)}</div>
+            {items}
+            <div class="query-note">점수는 질문 벡터와 청크 벡터의 코사인
+                유사도입니다. 질문과 청크를 따로 임베딩해 비교하므로(bi-encoder)
+                빠르지만 둘을 같이 읽고 판단하지는 못합니다. bge-m3 는 여러 언어를
+                한 벡터 공간에 넣으므로 한국어 질문으로 외국어 원문이 바로 걸립니다.
+                이 목록이 2단계 리랭킹의 후보가 됩니다.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_rerank(rr) -> None:
+    """2. 리랭킹 — 등수가 어떻게 바뀌었는지"""
+    method = {
+        "cross": f"크로스인코더 {rr.model or RERANKER_MODEL}",
+        "dense": "검색 점수 순서 (크로스인코더 실패)",
+    }.get(rr.method, rr.method)
+    rows = ""
+    for item in rr.ranked:
+        selected = item.rank_after <= len(rr.selected)
+        if item.moved > 0:
+            move = f'<span class="rr-up">▲{item.moved}</span>'
+        elif item.moved < 0:
+            move = f'<span class="rr-down">▼{-item.moved}</span>'
+        else:
+            move = '<span class="rr-same">-</span>'
+        score = (f'<span class="rr-llm">{item.llm_score}</span>'
+                 if item.llm_score is not None else "-")
+        rows += (
+            f'<tr class="{"rr-picked" if selected else ""}">'
+            f'<td class="qrank">{item.rank_after}</td>'
+            f'<td class="qrank">{item.rank_before}</td>'
+            f'<td>{move}</td>'
+            f'<td>{score}</td>'
+            f'<td><span class="qchunk">{item.hit.key}</span></td>'
+            f'<td class="rr-reason">{escape(item.reason)}</td></tr>'
+        )
+    st.markdown(
+        f"""
+        <div class="result-card">
+            <div class="card-title">2. 리랭킹
+                <span class="tag">{escape(method)}</span>
+                <span class="tag">{rr.elapsed:.1f}초</span></div>
+            <div class="qtable-wrap">
+                <table class="qtable">
+                    <thead><tr>
+                        <th class="qrank">후</th><th class="qrank">전</th>
+                        <th>이동</th><th>점수</th><th>청크</th><th>판단 근거</th>
+                    </tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+            <div class="query-note">점수는 cross-Encoder가 질의와 청크를 한 입력으로
+                붙여 읽고 낸 관련성입니다. 확률에 10을 곱해 정수로 표시했고,
+                원래 값과 logit 은 판단 근거 칸에 있습니다. 질의와 청크를 같이
+                읽으므로 "낱말만 겹치는 목차 청크"와 "답이 실제로 든 조문 청크"를
+                더 잘 가릅니다.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_selected(rr) -> None:
+    """3. 최종 청크 선정"""
+    items = "".join(
+        f'<div class="hit">'
+        f'  <div class="hit-head">'
+        f'    <span class="hit-rank">{rank}</span>'
+        f'    <span class="hit-src">{hit.key}</span>'
+        f'    <span>{escape(hit.doc_title)} · {escape(hit.doc_lang)} · '
+        f'{hit.token_start}~{hit.token_end}토큰</span>'
+        f'  </div>'
+        f'  <div class="hit-text">{escape(hit.preview(260))}</div>'
+        f'</div>'
+        for rank, hit in enumerate(rr.selected, 1)
+    )
+    st.markdown(
+        f"""
+        <div class="result-card">
+            <div class="card-title">3. 최종 청크 선정
+                <span class="tag">{len(rr.ranked)}개 → {len(rr.selected)}개</span>
+                <span class="tag">약 {len(rr.selected) * CHUNK_SIZE}토큰</span></div>
+            {items}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_answer(ans) -> None:
+    """4. LLM 답변"""
+    if ans is None:
+        return
+    if not ans.ok:
+        st.markdown(
+            f"""
+            <div class="result-card">
+                <div class="card-title">4. LLM 답변
+                    <span class="tag">실패</span></div>
+                <div class="query-note">{escape(ans.error or "")}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    badge = ('<span class="tag tag-changed">근거 존재</span>' if ans.enough
+             else '<span class="tag">근거 부족</span>')
+    cites = ("".join(f'<span class="cite">{escape(c)}</span>'
+                     for c in ans.citations)
+             if ans.citations else '<span class="cite-none">없음</span>')
+    note = (f'<div class="query-note">{escape(ans.note)}</div>'
+            if ans.note else "")
+    st.markdown(
+        f"""
+        <div class="result-card answer-card">
+            <div class="card-title">4. LLM 답변 {badge}
+                <span class="tag">{ans.elapsed:.1f}초</span></div>
+            <div class="answer-text">{escape(ans.answer)}</div>
+            <div class="cite-row">근거 {cites}</div>
+            {note}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_grade(gr) -> None:
+    """5. 정답 비교 — data/qa.json 의 정답과 4단계 답변을 나란히 놓는다."""
+    if gr is None:
+        return
+
+    if gr.correct:
+        style, mark = "grade-ok", "O"
+    elif gr.verdict == "오답":
+        style, mark = "grade-no", "X"
+    else:
+        style, mark = "grade-none", "?"
+
+    hit_words = ", ".join(gr.matched) if gr.matched else "없음"
+    st.markdown(
+        f"""
+        <div class="result-card grade-card {style}">
+            <div class="card-title">5. 정답 비교
+                <span class="tag tag-verdict {style}">{mark} {gr.verdict}</span>
+                <span class="tag">문자열 포함 판정</span></div>
+            <div class="grade-row">
+                <span class="grade-label">LLM 답변</span>
+                <span class="grade-value">{escape(gr.llm_answer) or "—"}</span>
+            </div>
+            <div class="grade-row">
+                <span class="grade-label">실제 정답</span>
+                <span class="grade-value grade-gold">
+                    {escape(gr.gold_display) or "—"}</span>
+            </div>
+            <div class="grade-row">
+                <span class="grade-label">정답 후보</span>
+                <span class="grade-value">{escape(", ".join(gr.candidates))}</span>
+            </div>
+            <div class="grade-row">
+                <span class="grade-label">겹친 후보</span>
+                <span class="grade-value">{mark} {escape(hit_words)}</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_all(result: PipelineResult) -> None:
+    """
+    완성된 결과에서 카드 5개를 한꺼번에 그린다.
+
+    캐시 히트 전용 경로다. 파이프라인이 돌지 않으므로 on_stage 콜백이 불리지
+    않고, 따라서 단계별로 그려 줄 사람이 없다. 순서는 on_stage 와 같아야 한다.
+    """
+    if result.search:
+        render_search(result.search)                        # 1
+    if result.rerank:
+        render_rerank(result.rerank)                        # 2
+        render_selected(result.rerank)                      # 3
+    render_answer(result.answer)                            # 4
+    render_grade(result.grade)                              # 5
+
+
+def dev_payload(result: PipelineResult) -> dict:
+    """개발용 데이터 보기에 넣을 것들."""
+    sr, rr, ans = result.search, result.rerank, result.answer
+    return {
+        "question": result.question,
+        "raw_question": result.raw_question,
+        "doc": result.doc,
+        "doc_name": result.doc_name,
+        "elapsed_sec": round(result.elapsed, 2),
+        "1_search": {
+            "query": sr.query,
+            "n_indexed": sr.n_indexed,
+            "n_docs": sr.n_docs,
+            "top_k": sr.top_k,
+            "hits": [f"{h.key} {h.score:.4f}" for h in sr.hits],
+        },
+        "2_3_rerank": {
+            "method": rr.method,
+            "error": rr.error,
+            "ranked": [
+                {
+                    "rank_after": x.rank_after,
+                    "rank_before": x.rank_before,
+                    "llm_score": x.llm_score,
+                    "dense": round(x.hit.score, 4),
+                    "chunk": x.hit.key,
+                    "reason": x.reason,
+                }
+                for x in rr.ranked
+            ],
+            "selected": [h.key for h in rr.selected],
+        },
+        "4_answer": None if ans is None else {
+            "answer": ans.answer,
+            "enough": ans.enough,
+            "citations": ans.citations,
+            "note": ans.note,
+            "model": ans.model,
+            "error": ans.error,
+        },
+        "5_grade": None if result.grade is None else {
+            "verdict": result.grade.verdict,
+            "correct": result.grade.correct,
+            "llm_answer": result.grade.llm_answer,
+            "gold_answer": result.grade.gold_answer,
+            "candidates": result.grade.candidates,
+            "matched": result.grade.matched,
+            "reason": result.grade.reason,
+        },
+        "selected_chunks": [
+            {"chunk": h.key, "doc": h.doc_title,
+             "tokens": [h.token_start, h.token_end], "text": h.text}
+            for h in result.selected
+        ],
+    }
+
+
+# ---------------------------------------------------------
+# 데이터셋 & 모델 탭
+#
+# 하드코딩하지 않고 실제 파일을 읽어 센다. 탭은 숨어 있어도 매번 실행되므로
+# (Streamlit 이 서버에서 다 그린 뒤 CSS 로 감춘다) 파일 읽기는 반드시 캐시한다.
+# ---------------------------------------------------------
+
+# 미리보기에 보낼 줄 수.
+PREVIEW_LINES = 60
+
+# 파이프라인이 도는 순서 그대로.
+MODELS = [
+    ("임베딩", EMBED_SHORT,
+     f"{EMBED_MODEL} · 1024차원 · 100개 넘는 언어를 한 벡터 공간에 넣는다"),
+    ("검색", "Cosine similarity",
+     "벡터가 L2 정규화돼 있어 내적이 곧 코사인 유사도"),
+    ("리랭킹", RERANKER_SHORT,
+     f"{RERANKER_MODEL} · 질문-청크 쌍을 직접 채점하는 크로스 인코더 (GPU)"),
+    ("답변", LLM_SHORT,
+     f"{LLM_MODEL} · 선정된 청크만 근거로 (GPU, bf16 {LLM_SIZE})"),
+]
+
+NEXT_STEPS = [
+    ("구조 인식 청킹",
+     "지금은 512토큰마다 기계적으로 자른다. 법령은 조, 보고서는 절이 자연스러운 "
+     "경계이므로 조·절 단위로 자르면 한 청크가 한 논점을 온전히 담는다."),
+    ("목차·머리말 걸러내기",
+     "목차와 쪽 머리글이 본문과 같은 낱말을 반복해 검색 상위에 올라온다. "
+     "색인 단계에서 걸러내거나 별도 표시를 달아 리랭킹에서 낮춘다."),
+    ("하이브리드 검색",
+     "조문 번호나 금액처럼 정확히 일치해야 하는 질의는 BM25 가 강하다. "
+     "dense 점수와 합쳐(RRF) 두 방식의 약점을 서로 메운다."),
+    ("pgvector 추가",
+     "pgvector 를 도입해 벡터 검색과 함께 문서·언어·발간연도 등 "
+     "메타데이터 기반 필터링 기능을 추가."),
+    ("질문-정답셋 확대",
+     "지금은 문서당 3문항이다. 검색·리랭킹 전략을 바꿨을 때 실제로 좋아졌는지 "
+     "Recall@K, nDCG@K 로 비교할 수 있도록 평가셋을 넓힌다."),
+    ("캐시 기능",
+     "반복 질의에 대한 임베딩·검색·생성 결과를 재사용하여 응답 속도 향상. "
+     "로컬 실행이라 비용보다 GPU 점유 시간과 대기 시간이 관건."),
+]
+
+
+@st.cache_data(show_spinner=False)
+def corpus_stats() -> list[dict]:
+    """문서마다 원문 크기와 색인 규모를 센다."""
+    import numpy as np
+
+    rows = []
+    for doc in DOCUMENTS:
+        chunks = tokens = dim = 0
+        try:
+            with np.load(doc.emb_path, allow_pickle=False) as z:
+                n, d = z["embeddings"].shape
+                chunks, dim = int(n), int(d)
+                tokens = int(z["token_count"].sum())
+        except Exception:  # noqa: BLE001 - 깨진 파일은 0 으로 둔다
+            pass
+
+        chars = 0
+        if doc.has_text:
+            try:
+                chars = len(read_source(doc.txt_path)[0])
+            except OSError:
+                pass
+
+        rows.append({
+            "코드": doc.code,
+            "제목": doc.title,
+            "언어": doc.lang_name,
+            "글자": chars,
+            "청크": chunks,
+            "토큰": tokens,
+            "차원": dim,
+            "설명": doc.note,
+        })
+    return rows
+
+
+@st.cache_data(show_spinner=False)
+def raw_preview(key: str, n_lines: int = PREVIEW_LINES) -> tuple[str, int]:
+    """원문의 앞부분. (본문, 전체 줄 수)"""
+    doc = next((d for d in DOCUMENTS if d.key == key), None)
+    if doc is None or not doc.has_text:
+        return "", 0
+    try:
+        text = read_source(doc.txt_path)[0]
+    except OSError:
+        return "", 0
+    lines = text.splitlines()
+    return "\n".join(lines[:n_lines]), len(lines)
+
+
+def _kv_table(pairs: list[tuple[str, str]]) -> str:
+    """항목 | 값 두 칸짜리 표."""
+    rows = "".join(
+        f'<tr><td class="dkey">{k}</td><td>{v}</td></tr>' for k, v in pairs
+    )
+    return f'<table class="dtable"><tbody>{rows}</tbody></table>'
+
+
+def render_dataset_tab() -> None:
+    rows = corpus_stats()
+
+    # ---- 데이터셋 -------------------------------------------------------
+    st.markdown('<div class="dhead">데이터셋</div>', unsafe_allow_html=True)
+
+    if rows:
+        head = ("<tr><th>코드</th><th>문서</th><th>언어</th>"
+                "<th class='num'>원문 글자</th><th class='num'>청크</th>"
+                "<th class='num'>토큰</th></tr>")
+        body = "".join(
+            f"<tr><td class='dkey'>{escape(r['코드'])}</td>"
+            f"<td class='dmodel'>{escape(r['제목'])}"
+            f"<div class='dnote'>{escape(r['설명'])}</div></td>"
+            f"<td>{escape(r['언어'])}</td>"
+            f"<td class='num'>{r['글자']:,}</td>"
+            f"<td class='num'>{r['청크']}</td>"
+            f"<td class='num'>{r['토큰']:,}</td></tr>"
+            for r in rows
+        )
+        total_chunks = sum(r["청크"] for r in rows)
+        total_tokens = sum(r["토큰"] for r in rows)
+        st.markdown(
+            f"""
+            <div class="result-card">
+                <div class="dtitle">문서 {len(rows)}종</div>
+                <div class="ddesc">각국의 마약·부패·자금세탁·고문방지 관련 법령과
+                    보고서입니다. 원문 언어가 7가지로 흩어져 있고 질문은 한국어로
+                    들어오므로, 번역을 끼우지 않고 교차 언어로 검색합니다.</div>
+                <table class="dtable">
+                    <thead>{head}</thead><tbody>{body}</tbody>
+                </table>
+                <div class="dsource"><b>합계</b> · 청크 {total_chunks:,}개 ·
+                    {total_tokens:,}토큰 · {rows[0]['차원']}차원
+                    <div class="dsource-sub">같은 분량이라도 언어마다 청크 수가
+                        다릅니다. 토크나이저가 언어별로 글자를 다르게 쪼개기
+                        때문이며, 언어별 검색 결과를 비교할 때 감안해야 합니다.
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.warning(
+            f"색인이 비어 있습니다. `python src/embed.py` 를 먼저 돌리세요."
+        )
+
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+
+    # ---- 원문 미리보기 ---------------------------------------------------
+    if DOCUMENTS:
+        picked = st.selectbox(
+            label="원문 미리보기",
+            options=[d.key for d in DOCUMENTS],
+            format_func=lambda k: next(d.label for d in DOCUMENTS if d.key == k),
+            key="preview_doc",
+        )
+        preview, total_lines = raw_preview(picked)
+        if preview:
+            shown = min(PREVIEW_LINES, total_lines)
+            st.markdown(
+                f'<div class="dpreview-label">원문 · '
+                f'<code>data/txt/{escape(picked)}.txt</code> '
+                f'— 전체 {total_lines:,}줄 중 앞 {shown}줄</div>',
+                unsafe_allow_html=True,
+            )
+            st.code(preview, language="text", height=520, line_numbers=True)
+
+        st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+
+    # ---- 전처리 ---------------------------------------------------------
+    st.markdown(
+        f"""
+        <div class="result-card">
+            <div class="dtitle">전처리</div>
+            {_kv_table([
+                ("본문 추출",
+                 "PDF 에서 뽑은 파일은 JSON 껍데기에 담겨 있어 text 필드만 "
+                 "꺼내 씁니다. 껍데기째 넣으면 메타데이터가 첫 청크를 오염시킵니다."),
+                ("청킹",
+                 f"{CHUNK_SIZE} / {OVERLAP}토큰 — bge-m3 토크나이저로 "
+                 f"{CHUNK_SIZE}토큰마다 자르고 {OVERLAP}토큰을 겹칩니다. "
+                 "글자 수로 자르면 언어마다 청크의 정보량이 들쭉날쭉해집니다."),
+                ("겹치는 이유",
+                 "한 조문이 청크 경계에 걸려 잘리면 답의 앞뒤가 나뉩니다. "
+                 f"{OVERLAP}토큰을 겹쳐 그 경계를 덮습니다."),
+                ("정규화",
+                 "벡터를 L2 정규화해 저장합니다. 검색이 내적을 그대로 코사인 "
+                 "유사도로 쓸 수 있습니다."),
+                ("메타데이터",
+                 "청크마다 문서 코드 · 청크 번호 · 토큰 위치를 함께 저장합니다. "
+                 "인용 표기(ko#12)가 여기서 나옵니다. 벡터에는 들어가지 않습니다."),
+            ])}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+
+    # ---- 질문-정답 세트 --------------------------------------------------
+    if QUESTIONS:
+        by_doc: dict[str, int] = {}
+        for q in QUESTIONS:
+            by_doc[q.doc] = by_doc.get(q.doc, 0) + 1
+        body = "".join(
+            f'<tr><td class="dkey">{q.id}</td>'
+            f'<td>{escape(q.question)}'
+            f'<div class="dnote">정답 · {escape(q.answer)}</div></td>'
+            f'<td class="dnote">{escape(" / ".join(q.keywords))}</td></tr>'
+            for q in QUESTIONS
+        )
+        st.markdown(
+            f"""
+            <div class="result-card">
+                <div class="dtitle">질문-정답 세트 {len(QUESTIONS)}문항</div>
+                <div class="ddesc">원문을 읽고 만든 세트입니다
+                    (<code>data/qa.json</code>). 질문과 정답은 한국어이고 근거는
+                    7개 언어이므로, 그대로 돌리면 교차 언어 검색 평가가 됩니다.
+                    5단계는 정답 후보가 답변 안에 하나라도 들어 있는지만 봅니다.</div>
+                <table class="dtable">
+                    <thead><tr><th>번호</th><th>질문 · 정답</th>
+                        <th>정답 후보</th></tr></thead>
+                    <tbody>{body}</tbody>
+                </table>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+
+    # ---- 모델 -----------------------------------------------------------
+    body = "".join(
+        f'<tr><td class="dkey">{escape(role)}</td>'
+        f'<td class="dmodel">{escape(name)}</td>'
+        f'<td class="dnote">{escape(note)}</td></tr>'
+        for role, name, note in MODELS
+    )
+    st.markdown(
+        f"""
+        <div class="result-card">
+            <div class="dtitle">모델</div>
+            <table class="dtable">
+                <thead><tr><th>단계</th><th>모델</th><th>비고</th></tr></thead>
+                <tbody>{body}</tbody>
+            </table>
+            <div class="ddesc" style="margin-top:.9rem">임베딩과 리랭킹이 같은
+                m3 계열입니다. 두 단계가 같은 다국어 감각으로 움직여야 1단계에서
+                올라온 외국어 청크를 2단계가 엉뚱하게 떨어뜨리지 않습니다.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+
+    # ---- 다음 단계 ------------------------------------------------------
+    body = "".join(
+        f'<tr><td class="dkey">{i}. {escape(title)}</td>'
+        f'<td>{escape(desc)}</td></tr>'
+        for i, (title, desc) in enumerate(NEXT_STEPS, 1)
+    )
+    st.markdown(
+        f'<div class="result-card">'
+        f'<div class="dtitle">다음 단계</div>'
+        f'<table class="dtable"><tbody>{body}</tbody></table></div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------
+# 스타일
+# ---------------------------------------------------------
+st.markdown(
+    """
+    <style>
+        /* Outfit / Inter 는 시스템에 없어 웹폰트로 가져온다 */
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@800&family=Inter:wght@400;500;700&display=swap');
+
+        .block-container {
+            max-width: 1080px;
+            padding-top: 3rem;
+            padding-bottom: 3rem;
+        }
+
+        .main-title {
+            font-family: 'Outfit', 'Inter', sans-serif;
+            background: linear-gradient(90deg, #4A90E2, #8E2DE2);
+            -webkit-background-clip: text;
+            background-clip: text;              /* 웹킷 아닌 브라우저용 */
+            -webkit-text-fill-color: transparent;
+            font-weight: 800;
+            font-size: 2.8rem;
+            margin-bottom: 0.2rem;
+        }
+        .subtitle {
+            font-family: 'Inter', sans-serif;
+            color: #7f8c8d;
+            font-size: 1.05rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .section-label {
+            font-size: 0.92rem;
+            font-weight: 700;
+            margin-bottom: 0.35rem;
+        }
+
+        .pipeline-card {
+            border: 1px solid #E4E7EC;
+            border-radius: 10px;
+            padding: 0.5rem 0.6rem;
+            text-align: center;
+            min-height: 58px;
+            background: #FFFFFF;
+        }
+
+        .pipeline-number {
+            font-size: 0.7rem;
+            color: #98A2B3;
+            margin-bottom: 0.1rem;
+        }
+
+        .pipeline-name {
+            font-size: 0.84rem;
+            font-weight: 650;
+            line-height: 1.3;
+        }
+
+        /* 처리 단계와 검색 폼 사이 간격 */
+        .section-gap { height: 2.2rem; }
+
+        .result-card {
+            border: 1px solid #D0D5DD;
+            border-radius: 14px;
+            padding: 1.25rem 1.35rem;
+            background: #F9FAFB;
+            /* 카드마다 st.markdown 이 따로 나가므로 카드 사이 여백은 이것 하나로 */
+            margin-top: 1.2rem;
+        }
+
+        .card-title {
+            font-size: 0.95rem;
+            font-weight: 700;
+            margin-bottom: 0.75rem;
+        }
+
+        /* 검색 랭킹 카드 */
+        .query-origin {
+            font-size: 0.8rem;
+            color: #98A2B3;
+            margin-bottom: 0.6rem;
+        }
+        .query-note {
+            font-size: 0.82rem;
+            color: #667085;
+            margin-top: 0.55rem;
+        }
+
+        /* 2. 리랭킹 표 */
+        .qtable-wrap {
+            overflow-x: auto;          /* 칸이 늘어도 페이지가 밀리지 않게 */
+            margin-top: 0.3rem;
+        }
+        .qtable {
+            border-collapse: collapse;
+            width: 100%;
+            font-size: 0.8rem;
+        }
+        .qtable th, .qtable td {
+            padding: 0.34rem 0.5rem;
+            border-bottom: 1px solid #EAECF0;
+            text-align: left;
+            white-space: nowrap;
+        }
+        .qtable th {
+            font-weight: 700;
+            color: #475467;
+            border-bottom: 1px solid #D0D5DD;
+        }
+        .qrank {
+            color: #98A2B3;
+            font-variant-numeric: tabular-nums;
+            width: 2rem;
+        }
+        .qscore {
+            font-variant-numeric: tabular-nums;
+            color: #344054;
+            margin-right: 0.35rem;
+        }
+        .qchunk {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 0.74rem;
+            color: #667085;
+        }
+        /* 3. 최종 청크 선정 카드 */
+        .hit {
+            padding: 0.6rem 0;
+            border-top: 1px solid #EAECF0;
+        }
+        .hit:first-of-type { border-top: none; padding-top: 0; }
+
+        .hit-head {
+            display: flex;
+            align-items: baseline;
+            gap: 0.5rem;
+            font-size: 0.8rem;
+            color: #667085;
+            margin-bottom: 0.25rem;
+        }
+        .hit-rank {
+            font-weight: 700;
+            color: #3B5BDB;
+            min-width: 1.4rem;
+        }
+        .hit-score {
+            font-variant-numeric: tabular-nums;
+            font-weight: 600;
+            color: #344054;
+        }
+        .hit-src {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 0.76rem;
+            background: #EAECF0;
+            border-radius: 4px;
+            padding: 0.05rem 0.35rem;
+        }
+        .hit-text {
+            font-size: 0.9rem;
+            line-height: 1.55;
+        }
+
+        /* 1. 검색 랭킹 목록 : 한 항목이 정확히 한 줄 */
+        .hit-line {
+            display: flex;
+            align-items: baseline;
+            gap: 0.5rem;
+            padding: 0.3rem 0;
+            border-top: 1px solid #EAECF0;
+            font-size: 0.82rem;
+        }
+        .hit-line:first-of-type { border-top: none; }
+
+        /* 넘치는 만큼만 '...' 로 자른다. min-width:0 이 없으면 flex 항목이 안 줄어든다 */
+        .hit-oneline {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: #475467;
+        }
+
+        /* 2. 리랭킹 표의 이동 표시 */
+        .rr-up   { color: #2F9E44; font-weight: 700; }
+        .rr-down { color: #E03131; font-weight: 700; }
+        .rr-same { color: #C1C7D0; }
+        .rr-llm  { font-weight: 700; color: #344054; }
+        .rr-reason {
+            color: #667085;
+            white-space: normal;      /* 근거 문장만 줄바꿈 허용 */
+            min-width: 18rem;
+        }
+        .qtable tr.rr-picked td { background: rgba(76, 110, 245, 0.09); }
+
+        /* 4. LLM 답변 */
+        .answer-card {
+            background: #FFFFFF;
+            border-color: #B9C6FF;
+        }
+        .answer-text {
+            font-size: 1.05rem;
+            line-height: 1.65;
+            font-weight: 500;
+        }
+        /* color 를 지정하지 않아야 .answer-text 와 같이 테마 글자색을 물려받는다 */
+        .cite-row {
+            margin-top: 0.7rem;
+            font-size: 1.05rem;
+            line-height: 1.65;
+            font-weight: 500;
+        }
+        .cite {
+            font-weight: 700;
+            margin-left: 0.3rem;
+        }
+        .cite-none { margin-left: 0.3rem; }
+
+        /* 5. 정답 비교 */
+        .grade-card.grade-ok   { border-color: #8CE99A; background: #F4FCF5; }
+        .grade-card.grade-no   { border-color: #FFA8A8; background: #FFF5F5; }
+        .grade-card.grade-none { border-color: #D0D5DD; }
+
+        .tag-verdict { font-weight: 700; }
+        .tag-verdict.grade-ok   { background: rgba(47,158,68,.16);  color: #2B8A3E; }
+        .tag-verdict.grade-no   { background: rgba(224,49,49,.14);  color: #C92A2A; }
+        .tag-verdict.grade-none { background: #EAECF0; color: #667085; }
+
+        .grade-row {
+            display: flex;
+            gap: 0.75rem;
+            padding: 0.4rem 0;
+            border-top: 1px solid rgba(0, 0, 0, 0.06);
+            font-size: 0.95rem;
+            line-height: 1.5;
+        }
+        .grade-row:first-of-type { border-top: none; }
+        .grade-label {
+            flex: 0 0 5.5rem;
+            color: #667085;
+            font-size: 0.85rem;
+            font-weight: 600;
+            padding-top: 0.1rem;
+        }
+        .grade-value { flex: 1; min-width: 0; }
+        .grade-gold { font-weight: 700; }
+
+        .tag {
+            display: inline-block;
+            font-size: 0.72rem;
+            font-weight: 600;
+            padding: 0.1rem 0.45rem;
+            border-radius: 5px;
+            background: #EAECF0;
+            color: #475467;
+            margin-left: 0.4rem;
+            vertical-align: middle;
+        }
+        .tag-changed {
+            background: rgba(76,110,245,.14);
+            color: #3B5BDB;
+        }
+
+        /* ---- 데이터셋 & 모델 탭 (읽는 화면이라 데모 탭보다 한 단계 크게) ---- */
+        .dhead {
+            font-size: 1.45rem;
+            font-weight: 800;
+            letter-spacing: -0.02em;
+            margin: 0 0 0.6rem;
+        }
+        .dtitle {
+            font-size: 1.35rem;
+            font-weight: 750;
+            margin-bottom: 0.5rem;
+        }
+        .ddesc {
+            font-size: 1.02rem;
+            line-height: 1.7;
+            color: #475467;
+            margin-bottom: 1.1rem;
+        }
+
+        .dtable {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 1.05rem;
+            line-height: 1.6;
+        }
+        .dtable th {
+            background: #F2F4F7;
+            color: #475467;
+            font-size: 0.95rem;
+            font-weight: 700;
+            text-align: left;
+            padding: 0.6rem 0.9rem;
+            border-bottom: 1px solid #D0D5DD;
+        }
+        .dtable td {
+            padding: 0.72rem 0.9rem;
+            border-bottom: 1px solid #EAECF0;
+            vertical-align: top;
+        }
+        .dtable tr:last-child td { border-bottom: none; }
+        .dtable td.dkey {
+            width: 190px;
+            font-weight: 700;
+            color: #344054;
+            background: #FCFCFD;
+            white-space: nowrap;
+        }
+        .dtable td.dmodel {
+            font-weight: 700;
+            font-size: 1.05rem;
+        }
+        .dtable td.dnote, .dtable .dnote {
+            color: #667085;
+            font-size: 0.95rem;
+            font-weight: 400;
+        }
+        .dtable .num, .dtable th.num {
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* 원문 미리보기 라벨 */
+        .dpreview-label {
+            font-size: 0.98rem;
+            color: #475467;
+            margin-bottom: 0.45rem;
+        }
+        .dpreview-label code {
+            font-size: 0.92rem;
+            color: #344054;
+            background: #F2F4F7;
+            padding: 0.1rem 0.35rem;
+            border-radius: 4px;
+        }
+
+        /* 표 바로 아래 붙는 출처 */
+        .dsource {
+            margin-top: 1rem;
+            padding-top: 0.85rem;
+            border-top: 1px solid #EAECF0;
+            font-size: 0.98rem;
+            color: #475467;
+        }
+        .dsource-sub {
+            margin-top: 0.25rem;
+            font-size: 0.92rem;
+            color: #98A2B3;
+        }
+        .dsource a { color: #3B5BDB; }
+
+        div.stButton > button {
+            height: 3rem;
+            font-size: 1rem;
+            font-weight: 700;
+            border-radius: 10px;
+        }
+        .st-key-dataset_tab [data-stale="true"],
+        .st-key-dataset_tab[data-stale="true"] {
+            opacity: 1 !important;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ---------------------------------------------------------
+# 화면
+# ---------------------------------------------------------
+st.markdown('<h1 class="main-title">문서 AI 모델 데모</h1>', unsafe_allow_html=True)
+st.markdown(
+    f'<p class="subtitle">{escape(EMBED_SHORT)}, {escape(RERANKER_SHORT)}, '
+    f'{escape(LLM_SHORT)} · 문서 {len(DOCUMENTS)}종 · 7개 언어</p>',
+    unsafe_allow_html=True,
+)
+
+tab_demo, tab_data = st.tabs(["🔎  데모", "📚  데이터셋 & 모델"])
+
+with tab_data:
+    with st.container(key="dataset_tab"):
+        render_dataset_tab()
+
+with tab_demo:
+    st.markdown("#### 처리 단계")
+
+    pipeline_columns = st.columns(len(PIPELINE_STEPS), gap="small")
+    for index, (column, step_name) in enumerate(
+        zip(pipeline_columns, PIPELINE_STEPS),
+        start=1,
+    ):
+        with column:
+            st.markdown(
+                f"""
+                <div class="pipeline-card">
+                    <div class="pipeline-number">STEP {index}</div>
+                    <div class="pipeline-name">{step_name}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+
+    with st.form("rag_search_form", clear_on_submit=False):
+        left, right = st.columns([3, 2], gap="large")
+
+        with left:
+            st.markdown(
+                '<div class="section-label">1. 질문 선택</div>',
+                unsafe_allow_html=True,
+            )
+            selected_question = st.selectbox(
+                label="질문",
+                options=QUESTION_OPTIONS,
+                label_visibility="collapsed",
+            )
+
+        with right:
+            st.markdown(
+                '<div class="section-label">2. 검색 문서 선택</div>',
+                unsafe_allow_html=True,
+            )
+            selected_document = st.selectbox(
+                label="검색 문서",
+                options=list(DOCUMENT_OPTIONS.keys()),
+                label_visibility="collapsed",
+            )
+
+        st.markdown(
+            '<div class="section-label" style="margin-top:.8rem">'
+            '3. 직접 묻기 (비워 두면 위에서 고른 질문)</div>',
+            unsafe_allow_html=True,
+        )
+        # 정답표에 없는 질문이므로 5단계(정답 비교)는 건너뛴다.
+        typed_question = st.text_input(
+            label="직접 입력",
+            placeholder="예) 사형 집행유예 기간이 지나면 형이 어떻게 되나요?",
+            label_visibility="collapsed",
+        )
+
+        st.write("")
+        search_clicked = st.form_submit_button(
+            "검색",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if search_clicked:
+        doc_key = DOCUMENT_OPTIONS[selected_document]
+        doc_arg = None if doc_key == ALL_DOCS else doc_key
+
+        question = (typed_question or "").strip() or selected_question
+
+        # 5단계용 실제 정답. 직접 입력한 질문은 정답표에 없으므로 못 찾고,
+        # 그러면 gold 가 비어 5단계를 건너뛴다.
+        found = find_question(question)
+        gold = list(found.keywords) if found else []
+
+        # 이미 돌려 본 조합이면 GPU 를 다시 태우지 않는다. 같은 질문을 반복해
+        # 보여주는 시연에서 매번 답변 생성을 다시 도는 것을 막는다.
+        # 세션 단위라 새 탭이나 서버 재시작에는 남지 않는다.
+        cache: dict = st.session_state.setdefault("results", {})
+        cache_key = (question, doc_key)
+
+        # 진행 상태 한 줄. 단계가 끝날 때마다 문구를 갈아 끼우고 마지막에 지운다.
+        progress = st.empty()
+        progress.info(
+            f"질의를 {EMBED_SHORT} 로 임베딩해 {selected_document}에서 청크를 "
+            "찾고 있습니다. (예상 시간: 20초)"
+        )
+
+        def on_stage(stage: str, payload) -> None:
+            """단계가 끝날 때마다 불린다. 끝난 단계부터 바로 그린다."""
+            if stage == "search":
+                render_search(payload)           # 1번
+                progress.info(
+                    f"후보 {len(payload.hits)}개를 {RERANKER_MODEL} 로 재점수하고 "
+                    "있습니다."
+                )
+
+            elif stage == "rerank":
+                render_rerank(payload)           # 2번
+                render_selected(payload)         # 3번
+                progress.info(
+                    f"{LLM_MODEL} 이 근거 청크를 읽고 답변을 만들고 있습니다. "
+                    "(예상 시간: 1분)"
+                )
+
+            elif stage == "answer":
+                render_answer(payload)           # 4번
+                if gold:
+                    progress.info("실제 정답과 견주고 있습니다.")
+                else:
+                    progress.empty()
+
+            elif stage == "grade":
+                progress.empty()
+                render_grade(payload)            # 5번
+
+        if cache_key in cache:
+            # 캐시 히트. 단계별로 그려 줄 콜백이 안 불리므로 한꺼번에 그린다.
+            progress.empty()
+            result = cache[cache_key]
+            render_all(result)
+            cached = True
+        else:
+            result = run_pipeline(question, doc=doc_arg, gold=gold,
+                                  on_stage=on_stage)
+            cached = False
+            # 실패한 결과는 캐시하지 않는다. 일시적인 OOM 이나 파싱 실패가
+            # 캐시에 박히면 다시 눌러도 계속 그 결과만 나온다.
+            if not result.errors():
+                cache[cache_key] = result
+
+        for stage_name, message in result.errors().items():
+            st.warning(f"{stage_name} 단계가 실패했습니다. {message}")
+
+        if not gold:
+            st.caption("정답표에 없는 질문이라 5단계(정답 비교)는 건너뛰었습니다.")
+
+        st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+
+        if cached:
+            st.caption(f"이전 실행 결과를 재사용했습니다 "
+                       f"(원래 {result.elapsed:.1f}초). "
+                       f"다시 계산하려면 페이지를 새로 고칩니다.")
+
+        with st.expander("개발용 데이터 보기"):
+            st.json(dev_payload(result))
