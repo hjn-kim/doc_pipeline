@@ -38,7 +38,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from rerank import FINAL_TOP_N, RankedHit, RerankResult  # noqa: E402
+from rerank import FINAL_TOP_N, RankedHit, RerankResult, sort_ranked  # noqa: E402
 from search import SearchResult, search  # noqa: E402
 
 DEFAULT_MODEL = "BAAI/bge-reranker-v2-m3"
@@ -106,7 +106,8 @@ def rerank_cross(question: str, result: SearchResult, top_n: int = FINAL_TOP_N,
     """
     검색 결과를 크로스인코더로 다시 줄 세우고 상위 top_n 을 고른다.
 
-      RankedHit.llm_score  0~10 정수 (확률 x 10 을 반올림)
+      RankedHit.score      raw logit. 정렬은 이 값으로 한다
+      RankedHit.prob       위를 시그모이드에 넣은 0~1 확률 (표시용)
       RankedHit.reason     "관련성 0.985 (logit +4.21)"
       RerankResult.method  "cross", 실패하면 "dense"
     """
@@ -127,26 +128,31 @@ def rerank_cross(question: str, result: SearchResult, top_n: int = FINAL_TOP_N,
     try:
         logits = cross_scores(question, [h.hit.text for h in ranked],
                               model_name, device, batch_size)
-        # 시그모이드로 0~1 확률을 만든다. 표에는 x10 한 정수를 쓰고 원래 값은
-        # 근거 칸에 남긴다. logit 을 함께 보여야 상위권끼리의 격차가 드러난다.
-        probs = 1.0 / (1.0 + np.exp(-logits))
+        # 정렬은 raw logit 으로 한다. 확률은 화면 표시용으로만 쓴다.
+        #
+        # 예전에는 확률 x10 을 반올림한 0~10 정수로 줄을 세웠는데, 질문과 청크의
+        # 언어가 다르면 이 모델의 확률이 0.001 언저리로 깔려서 후보가 전부 0 으로
+        # 동점이 되고 결국 dense 순서가 그대로 복원됐다. 리랭킹이 무효가 된다.
+        # logit 은 반올림하지 않으므로 그 구간에서도 순서가 살아 있다.
+        #
+        # 시그모이드는 float64 로 계산한다. float32 는 logit 이 -88 아래로
+        # 내려가면 exp 가 넘쳐 inf 가 되고 경고가 뜬다.
+        probs = 1.0 / (1.0 + np.exp(-logits.astype(np.float64)))
         for item, logit, prob in zip(ranked, logits, probs):
-            item.llm_score = int(round(float(prob) * 10))
+            item.score = float(logit)
+            item.prob = float(prob)
             item.reason = f"관련성 {prob:.3f} (logit {logit:+.2f})"
     except Exception as exc:  # noqa: BLE001 - 모델 없음/VRAM 부족 등 모두 여기로
         error = f"{type(exc).__name__}: {exc}"
         used = "dense"
         model_used = ""
         for item in ranked:
-            item.llm_score = None
+            item.score = None
+            item.prob = None
             item.reason = ""
 
-    # 정렬 기준: 크로스인코더 점수 -> dense 점수. 크로스인코더 점수는 0~10 으로
-    # 반올림한 값이라 동점이 나오는데, 그때는 검색 점수 순서를 그대로 따른다.
-    # 크로스인코더가 죽었으면 llm_score 가 전부 None 이라 dense 순서가 남는다.
-    ranked.sort(key=lambda x: (x.llm_score or 0, x.hit.score), reverse=True)
-    for rank, item in enumerate(ranked, 1):
-        item.rank_after = rank
+    # 정렬 기준: score -> dense 점수. 규칙 자체는 rerank.sort_ranked 에 있다.
+    sort_ranked(ranked)
 
     return RerankResult(
         question=question,
@@ -194,13 +200,12 @@ def main() -> None:
     if rr.error:
         print(f"[!] 크로스인코더 실패, 검색 순서로 대체: {rr.error}")
 
-    print(f"\n{'후':>3} {'전':>3} {'이동':>4} {'점수':>4} {'dense':>6}  청크")
+    print(f"\n{'후':>3} {'전':>3} {'이동':>4} {'관련성':>9} {'dense':>6}  청크")
     for item in rr.ranked:
         mark = "  <= 선정" if item.rank_after <= args.top_n else ""
         moved = f"{item.moved:+d}" if item.moved else "-"
-        score = f"{item.llm_score}" if item.llm_score is not None else "-"
-        print(f"{item.rank_after:>3} {item.rank_before:>3} {moved:>4} {score:>4} "
-              f"{item.hit.score:.4f}  {item.hit.key}{mark}")
+        print(f"{item.rank_after:>3} {item.rank_before:>3} {moved:>4} "
+              f"{item.percent:>9} {item.hit.score:.4f}  {item.hit.key}{mark}")
         if item.reason:
             print(f"                             {item.reason}")
 

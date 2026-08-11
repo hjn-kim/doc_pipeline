@@ -41,13 +41,56 @@ class RankedHit:
     hit: Hit
     rank_before: int              # 리랭킹 전 등수 (dense 점수순)
     rank_after: int = 0           # 리랭킹 후 등수
-    llm_score: int | None = None  # 0~10, 크로스인코더가 죽으면 None
+    score: float | None = None    # 크로스인코더 raw logit. 정렬은 이 값으로 한다
+    prob: float | None = None     # 위를 시그모이드에 넣은 0~1 확률 (표시용)
     reason: str = ""
 
     @property
     def moved(self) -> int:
         """등수가 몇 칸 올라갔는지. 양수면 상승."""
         return self.rank_before - self.rank_after
+
+    @property
+    def percent(self) -> str:
+        """
+        확률을 화면에 쓸 문자열로. 값이 아주 작아도 0 으로 뭉개지지 않게 한다.
+
+        질문과 근거의 언어가 다르면 이 모델의 확률은 0.001 언저리까지 내려간다.
+        절대값이 낮아도 후보끼리의 순서는 살아 있으므로 자릿수를 지켜 보여준다.
+        """
+        if self.prob is None:
+            return "-"
+        if self.prob >= 0.01:
+            return f"{self.prob * 100:.1f}%"
+        if self.prob >= 0.0001:
+            return f"{self.prob * 100:.3f}%"
+        return f"{self.prob * 100:.1e}%"
+
+
+# 점수가 없는 후보를 정렬에서 맨 뒤로 보내는 값. raw logit 은 음수가 정상
+# 범위(무관한 청크는 -10 근처)라 None 을 0 으로 대신 쓰면 채점에 실패한 후보가
+# 정상적으로 낮게 나온 후보보다 위로 올라간다.
+_NO_SCORE = float("-inf")
+
+
+def sort_ranked(ranked: list[RankedHit]) -> list[RankedHit]:
+    """
+    score(raw logit) 내림차순으로 줄 세우고 rank_after 를 매긴다.
+
+    정렬 기준을 이 한 곳에 둔다. 재점수는 rerank_gpu 가 하지만 "무엇으로
+    줄 세우는가" 는 RankedHit 을 정의한 여기가 정한다.
+
+    score 는 반올림하지 않은 실수라 사실상 동점이 없다. 크로스인코더가 죽어
+    전부 None 이면 두 번째 키인 dense 점수만 남아 검색 순서가 그대로 유지된다.
+    """
+    ranked.sort(
+        key=lambda x: (x.score if x.score is not None else _NO_SCORE,
+                       x.hit.score),
+        reverse=True,
+    )
+    for rank, item in enumerate(ranked, 1):
+        item.rank_after = rank
+    return ranked
 
 
 @dataclass

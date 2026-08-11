@@ -200,10 +200,9 @@ def main() -> None:
     print(f"\n[2] 리랭킹       {rr.method}  ({rr.elapsed:.1f}초)")
     for item in rr.ranked[:args.final_n + 3]:
         mark = " <= 선정" if item.rank_after <= args.final_n else ""
-        score = f"{item.llm_score:>2}" if item.llm_score is not None else " -"
         moved = f"{item.moved:+d}" if item.moved else "  "
         print(f"    {item.rank_after:>2}위 (전 {item.rank_before:>2}위 {moved:>3}) "
-              f"점수 {score}  {item.hit.key}{mark}")
+              f"관련성 {item.percent:>9}  {item.hit.key}{mark}")
 
     print(f"\n[3] 최종 선정    {len(rr.selected)}개  "
           f"{', '.join(h.key for h in rr.selected)}")

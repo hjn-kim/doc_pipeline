@@ -73,7 +73,11 @@ DOCUMENT_OPTIONS = {f"전체 문서 {len(DOCUMENTS)}종": ALL_DOCS}
 DOCUMENT_OPTIONS.update({doc.label: doc.key for doc in DOCUMENTS})
 
 QUESTIONS = load_questions()
-QUESTION_OPTIONS = [q.label for q in QUESTIONS]
+
+# 목록 맨 앞에 두는 항목. 이걸 고르면 아래에 입력칸이 열리고, 나머지 질문은
+# 한 칸씩 밀린다. 정답표에 없는 질문이라 5단계(정답 비교)는 건너뛰게 된다.
+CUSTOM_QUESTION = "직접 질문"
+QUESTION_OPTIONS = [CUSTOM_QUESTION] + [q.label for q in QUESTIONS]
 
 PIPELINE_STEPS = [
     "검색 랭킹",
@@ -140,8 +144,8 @@ def render_rerank(rr) -> None:
             move = f'<span class="rr-down">▼{-item.moved}</span>'
         else:
             move = '<span class="rr-same">-</span>'
-        score = (f'<span class="rr-llm">{item.llm_score}</span>'
-                 if item.llm_score is not None else "-")
+        score = (f'<span class="rr-llm">{item.percent}</span>'
+                 if item.prob is not None else "-")
         rows += (
             f'<tr class="{"rr-picked" if selected else ""}">'
             f'<td class="qrank">{item.rank_after}</td>'
@@ -161,16 +165,17 @@ def render_rerank(rr) -> None:
                 <table class="qtable">
                     <thead><tr>
                         <th class="qrank">후</th><th class="qrank">전</th>
-                        <th>이동</th><th>점수</th><th>청크</th><th>판단 근거</th>
+                        <th>이동</th><th>관련성</th><th>청크</th><th>판단 근거</th>
                     </tr></thead>
                     <tbody>{rows}</tbody>
                 </table>
             </div>
-            <div class="query-note">점수는 cross-Encoder가 질의와 청크를 한 입력으로
-                붙여 읽고 낸 관련성입니다. 확률에 10을 곱해 정수로 표시했고,
-                원래 값과 logit 은 판단 근거 칸에 있습니다. 질의와 청크를 같이
-                읽으므로 "낱말만 겹치는 목차 청크"와 "답이 실제로 든 조문 청크"를
-                더 잘 가릅니다.
+            <div class="query-note">관련성은 cross-Encoder가 질의와 청크를 한 입력으로
+                붙여 읽고 낸 점수입니다. 순서는 반올림하지 않은 raw logit 으로
+                정하고 표에는 그것을 확률로 바꿔 적었습니다. 질문과 청크의 언어가
+                다르면 확률 자체는 1% 아래로 깔리지만 후보끼리의 순서는 그대로
+                유효합니다. 질의와 청크를 같이 읽으므로 "낱말만 겹치는 목차 청크"와
+                "답이 실제로 든 조문 청크"를 더 잘 가릅니다.
             </div>
         </div>
         """,
@@ -289,8 +294,9 @@ def render_all(result: PipelineResult) -> None:
     """
     완성된 결과에서 카드 5개를 한꺼번에 그린다.
 
-    캐시 히트 전용 경로다. 파이프라인이 돌지 않으므로 on_stage 콜백이 불리지
-    않고, 따라서 단계별로 그려 줄 사람이 없다. 순서는 on_stage 와 같아야 한다.
+    파이프라인을 돌리지 않는 경로 전용이다(캐시 히트, 지난 결과 되살리기).
+    on_stage 콜백이 불리지 않아 단계별로 그려 줄 사람이 없다. 순서는 on_stage
+    와 같아야 한다.
     """
     if result.search:
         render_search(result.search)                        # 1
@@ -299,6 +305,28 @@ def render_all(result: PipelineResult) -> None:
         render_selected(result.rerank)                      # 3
     render_answer(result.answer)                            # 4
     render_grade(result.grade)                              # 5
+
+
+def render_tail(result: PipelineResult, gold: list, note: str = "") -> None:
+    """
+    카드 5개 아래에 붙는 것들 - 실패 경고, 안내 문구, 개발용 데이터.
+
+    새로 돌렸을 때와 지난 결과를 되살렸을 때가 같아야 해서 함수로 뺐다.
+    note 는 결과의 출처를 알리는 한 줄이고, 갓 돌린 결과면 비운다.
+    """
+    for stage_name, message in result.errors().items():
+        st.warning(f"{stage_name} 단계가 실패했습니다. {message}")
+
+    if not gold:
+        st.caption("정답표에 없는 질문이라 5단계(정답 비교)는 건너뛰었습니다.")
+
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+
+    if note:
+        st.caption(note)
+
+    with st.expander("개발용 데이터 보기"):
+        st.json(dev_payload(result))
 
 
 def dev_payload(result: PipelineResult) -> dict:
@@ -324,7 +352,8 @@ def dev_payload(result: PipelineResult) -> dict:
                 {
                     "rank_after": x.rank_after,
                     "rank_before": x.rank_before,
-                    "llm_score": x.llm_score,
+                    "score": None if x.score is None else round(x.score, 4),
+                    "prob": None if x.prob is None else round(x.prob, 6),
                     "dense": round(x.hit.score, 4),
                     "chunk": x.hit.key,
                     "reason": x.reason,
@@ -1038,55 +1067,60 @@ with tab_demo:
 
     st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
 
-    with st.form("rag_search_form", clear_on_submit=False):
-        left, right = st.columns([3, 2], gap="large")
+    # st.form 을 쓰지 않는다. 폼 안에서는 위젯을 바꿔도 스크립트가 다시 돌지
+    # 않으므로, 질문을 "직접 질문" 으로 고른 그 자리에서 입력칸을 띄울 수 없다.
+    # 대신 위젯을 건드릴 때마다 화면이 다시 그려지므로, 마지막 결과를
+    # session_state 에 남겨 두고 아래에서 다시 그린다.
+    left, right = st.columns([3, 2], gap="large")
 
-        with left:
-            st.markdown(
-                '<div class="section-label">1. 질문 선택</div>',
-                unsafe_allow_html=True,
-            )
-            selected_question = st.selectbox(
-                label="질문",
-                options=QUESTION_OPTIONS,
-                label_visibility="collapsed",
-            )
-
-        with right:
-            st.markdown(
-                '<div class="section-label">2. 검색 문서 선택</div>',
-                unsafe_allow_html=True,
-            )
-            selected_document = st.selectbox(
-                label="검색 문서",
-                options=list(DOCUMENT_OPTIONS.keys()),
-                label_visibility="collapsed",
-            )
-
+    with left:
         st.markdown(
-            '<div class="section-label" style="margin-top:.8rem">'
-            '3. 직접 묻기 (비워 두면 위에서 고른 질문)</div>',
+            '<div class="section-label">1. 질문 선택</div>',
             unsafe_allow_html=True,
         )
-        # 정답표에 없는 질문이므로 5단계(정답 비교)는 건너뛴다.
-        typed_question = st.text_input(
-            label="직접 입력",
-            placeholder="예) 사형 집행유예 기간이 지나면 형이 어떻게 되나요?",
+        selected_question = st.selectbox(
+            label="질문",
+            options=QUESTION_OPTIONS,
             label_visibility="collapsed",
         )
 
-        st.write("")
-        search_clicked = st.form_submit_button(
-            "검색",
-            type="primary",
-            use_container_width=True,
+    with right:
+        st.markdown(
+            '<div class="section-label">2. 검색 문서 선택</div>',
+            unsafe_allow_html=True,
         )
+        selected_document = st.selectbox(
+            label="검색 문서",
+            options=list(DOCUMENT_OPTIONS.keys()),
+            label_visibility="collapsed",
+        )
+
+    # 목록에서 고른 질문이 곧 질의다. "직접 질문" 을 골랐을 때만 입력칸을 연다.
+    if selected_question == CUSTOM_QUESTION:
+        st.markdown(
+            '<div class="section-label" style="margin-top:.8rem">'
+            '직접 질문 입력</div>',
+            unsafe_allow_html=True,
+        )
+        question = st.text_input(
+            label="직접 질문",
+            placeholder="예: 대마재배자는 누구에게 허가를 받나요?",
+            label_visibility="collapsed",
+        ).strip()
+    else:
+        question = selected_question
+
+    st.write("")
+    search_clicked = st.button(
+        "검색",
+        type="primary",
+        use_container_width=True,
+        disabled=not question,
+    )
 
     if search_clicked:
         doc_key = DOCUMENT_OPTIONS[selected_document]
         doc_arg = None if doc_key == ALL_DOCS else doc_key
-
-        question = (typed_question or "").strip() or selected_question
 
         # 5단계용 실제 정답. 직접 입력한 질문은 정답표에 없으므로 못 찾고,
         # 그러면 gold 가 비어 5단계를 건너뛴다.
@@ -1139,28 +1173,29 @@ with tab_demo:
             progress.empty()
             result = cache[cache_key]
             render_all(result)
-            cached = True
+            note = (f"이전 실행 결과를 재사용했습니다 "
+                    f"(원래 {result.elapsed:.1f}초). "
+                    f"다시 계산하려면 페이지를 새로 고칩니다.")
         else:
             result = run_pipeline(question, doc=doc_arg, gold=gold,
                                   on_stage=on_stage)
-            cached = False
+            note = ""
             # 실패한 결과는 캐시하지 않는다. 일시적인 OOM 이나 파싱 실패가
             # 캐시에 박히면 다시 눌러도 계속 그 결과만 나온다.
             if not result.errors():
                 cache[cache_key] = result
 
-        for stage_name, message in result.errors().items():
-            st.warning(f"{stage_name} 단계가 실패했습니다. {message}")
+        # 질문을 바꾸거나 입력칸에 타자를 치면 스크립트가 처음부터 다시 도는데,
+        # 결과 카드는 이 블록 안에서만 그려지므로 그때 화면에서 사라진다.
+        # 마지막 결과를 남겨 두었다가 아래 elif 에서 되살린다.
+        st.session_state["last_run"] = (result, gold)
+        render_tail(result, gold, note)
 
-        if not gold:
-            st.caption("정답표에 없는 질문이라 5단계(정답 비교)는 건너뛰었습니다.")
-
-        st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
-
-        if cached:
-            st.caption(f"이전 실행 결과를 재사용했습니다 "
-                       f"(원래 {result.elapsed:.1f}초). "
-                       f"다시 계산하려면 페이지를 새로 고칩니다.")
-
-        with st.expander("개발용 데이터 보기"):
-            st.json(dev_payload(result))
+    elif st.session_state.get("last_run"):
+        # 검색을 누른 게 아니라 위젯을 건드려 다시 그려진 경우. 직전 결과를
+        # 그대로 되살린다. 파이프라인은 다시 돌지 않는다.
+        result, gold = st.session_state["last_run"]
+        render_all(result)
+        render_tail(result, gold,
+                    f"지난 검색 결과입니다 · {result.question} "
+                    f"({result.doc_name}). 검색을 누르면 새로 돌립니다.")
