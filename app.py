@@ -409,27 +409,6 @@ MODELS = [
      f"{LLM_MODEL} · 선정된 청크만 근거로 (GPU, bf16 {LLM_SIZE})"),
 ]
 
-NEXT_STEPS = [
-    ("구조 인식 청킹",
-     "지금은 512토큰마다 기계적으로 자른다. 법령은 조, 보고서는 절이 자연스러운 "
-     "경계이므로 조·절 단위로 자르면 한 청크가 한 논점을 온전히 담는다."),
-    ("목차·머리말 걸러내기",
-     "목차와 쪽 머리글이 본문과 같은 낱말을 반복해 검색 상위에 올라온다. "
-     "색인 단계에서 걸러내거나 별도 표시를 달아 리랭킹에서 낮춘다."),
-    ("하이브리드 검색",
-     "조문 번호나 금액처럼 정확히 일치해야 하는 질의는 BM25 가 강하다. "
-     "dense 점수와 합쳐(RRF) 두 방식의 약점을 서로 메운다."),
-    ("pgvector 추가",
-     "pgvector 를 도입해 벡터 검색과 함께 문서·언어·발간연도 등 "
-     "메타데이터 기반 필터링 기능을 추가."),
-    ("질문-정답셋 확대",
-     "지금은 문서당 3문항이다. 검색·리랭킹 전략을 바꿨을 때 실제로 좋아졌는지 "
-     "Recall@K, nDCG@K 로 비교할 수 있도록 평가셋을 넓힌다."),
-    ("캐시 기능",
-     "반복 질의에 대한 임베딩·검색·생성 결과를 재사용하여 응답 속도 향상. "
-     "로컬 실행이라 비용보다 GPU 점유 시간과 대기 시간이 관건."),
-]
-
 
 @st.cache_data(show_spinner=False)
 def corpus_stats() -> list[dict]:
@@ -516,17 +495,12 @@ def render_dataset_tab() -> None:
             <div class="result-card">
                 <div class="dtitle">문서 {len(rows)}종</div>
                 <div class="ddesc">각국의 마약·부패·자금세탁·고문방지 관련 법령과
-                    보고서입니다. 원문 언어가 7가지로 흩어져 있고 질문은 한국어로
-                    들어오므로, 번역을 끼우지 않고 교차 언어로 검색합니다.</div>
-                <table class="dtable">
+                    문서입니다. 원문 언어는 7가지 언어이고 질문은 한국어로 번역 없이 교차 검색합니다.</div>
+                <table class="dtable dtable-docs">
                     <thead>{head}</thead><tbody>{body}</tbody>
                 </table>
                 <div class="dsource"><b>합계</b> · 청크 {total_chunks:,}개 ·
                     {total_tokens:,}토큰 · {rows[0]['차원']}차원
-                    <div class="dsource-sub">같은 분량이라도 언어마다 청크 수가
-                        다릅니다. 토크나이저가 언어별로 글자를 다르게 쪼개기
-                        때문이며, 언어별 검색 결과를 비교할 때 감안해야 합니다.
-                    </div>
                 </div>
             </div>
             """,
@@ -567,12 +541,12 @@ def render_dataset_tab() -> None:
             <div class="dtitle">전처리</div>
             {_kv_table([
                 ("본문 추출",
-                 "PDF 에서 뽑은 파일은 JSON 껍데기에 담겨 있어 text 필드만 "
-                 "꺼내 씁니다. 껍데기째 넣으면 메타데이터가 첫 청크를 오염시킵니다."),
+                 "PDF 에서 뽑은 파일은 JSON 에 담겨 있어 text 필드만 "
+                 "꺼내 씁니다."),
                 ("청킹",
                  f"{CHUNK_SIZE} / {OVERLAP}토큰 — bge-m3 토크나이저로 "
                  f"{CHUNK_SIZE}토큰마다 자르고 {OVERLAP}토큰을 겹칩니다. "
-                 "글자 수로 자르면 언어마다 청크의 정보량이 들쭉날쭉해집니다."),
+                 ),
                 ("겹치는 이유",
                  "한 조문이 청크 경계에 걸려 잘리면 답의 앞뒤가 나뉩니다. "
                  f"{OVERLAP}토큰을 겹쳐 그 경계를 덮습니다."),
@@ -580,8 +554,8 @@ def render_dataset_tab() -> None:
                  "벡터를 L2 정규화해 저장합니다. 검색이 내적을 그대로 코사인 "
                  "유사도로 쓸 수 있습니다."),
                 ("메타데이터",
-                 "청크마다 문서 코드 · 청크 번호 · 토큰 위치를 함께 저장합니다. "
-                 "인용 표기(ko#12)가 여기서 나옵니다. 벡터에는 들어가지 않습니다."),
+                 "청크마다 문서코드·청크번호·토큰 위치를 함께 저장합니다."
+                 "벡터에는 들어가지 않습니다."),
             ])}
         </div>
         """,
@@ -638,28 +612,13 @@ def render_dataset_tab() -> None:
                 <tbody>{body}</tbody>
             </table>
             <div class="ddesc" style="margin-top:.9rem">임베딩과 리랭킹이 같은
-                m3 계열입니다. 두 단계가 같은 다국어 감각으로 움직여야 1단계에서
-                올라온 외국어 청크를 2단계가 엉뚱하게 떨어뜨리지 않습니다.</div>
+                m3 계열입니다.</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
-
-    # ---- 다음 단계 ------------------------------------------------------
-    body = "".join(
-        f'<tr><td class="dkey">{i}. {escape(title)}</td>'
-        f'<td>{escape(desc)}</td></tr>'
-        for i, (title, desc) in enumerate(NEXT_STEPS, 1)
-    )
-    st.markdown(
-        f'<div class="result-card">'
-        f'<div class="dtitle">다음 단계</div>'
-        f'<table class="dtable"><tbody>{body}</tbody></table></div>',
-        unsafe_allow_html=True,
-    )
-
 
 # ---------------------------------------------------------
 # 스타일
@@ -730,6 +689,18 @@ st.markdown(
             background: #F9FAFB;
             /* 카드마다 st.markdown 이 따로 나가므로 카드 사이 여백은 이것 하나로 */
             margin-top: 1.2rem;
+        }
+
+        /* 질문·문서를 고르는 박스. 예전 st.form 이 그려 주던 테두리를 대신하고
+           결과 카드와 같은 모양으로 맞춘다. st.container(key="search_box") 가
+           붙여 주는 클래스이고, 위젯이 놓이는 세로 블록 자체에 붙으므로 여백도
+           여기에 준다. div 를 앞에 붙인 건 컨테이너가 기본으로 들고 있는
+           테두리·여백보다 우선순위를 높이기 위해서다. */
+        div.st-key-search_box {
+            border: 1px solid #D0D5DD;
+            border-radius: 14px;
+            background: #F9FAFB;
+            padding: 1.25rem 1.35rem;
         }
 
         .card-title {
@@ -985,6 +956,20 @@ st.markdown(
             font-variant-numeric: tabular-nums;
         }
 
+        /* 문서 표만 열 너비를 따로 잡는다. .dkey 는 다른 표 네 곳에서도 쓰므로
+           공용 값(190px)은 건드리지 않는다.
+
+           코드는 'ko', 'en' 처럼 두 글자뿐이라 190px 이 크게 남는다. 줄인 만큼을
+           제목과 설명이 함께 들어가는 문서 열이 가져가고, 원문 글자·청크 열은
+           머리글이 두 줄로 접히지 않을 만큼 넓힌다. 언어·토큰 열은 내용에 맞춰
+           그대로 둔다. */
+        .dtable-docs td.dkey { width: 64px; }
+        .dtable-docs th:nth-child(4),
+        .dtable-docs td:nth-child(4) { width: 120px; }   /* 원문 글자 */
+        .dtable-docs th:nth-child(5),
+        .dtable-docs td:nth-child(5) { width: 92px; }    /* 청크 */
+        .dtable-docs th.num { white-space: nowrap; }
+
         /* 원문 미리보기 라벨 */
         .dpreview-label {
             font-size: 0.98rem;
@@ -1071,52 +1056,57 @@ with tab_demo:
     # 않으므로, 질문을 "직접 질문" 으로 고른 그 자리에서 입력칸을 띄울 수 없다.
     # 대신 위젯을 건드릴 때마다 화면이 다시 그려지므로, 마지막 결과를
     # session_state 에 남겨 두고 아래에서 다시 그린다.
-    left, right = st.columns([3, 2], gap="large")
+    #
+    # 테두리는 폼이 그려 주던 것을 컨테이너로 대신한다. key 를 주면 그 이름으로
+    # .st-key-search_box 클래스가 붙어 결과 카드와 같은 모양으로 맞출 수 있다.
+    # 직접 질문 입력칸이 열리면 박스가 그만큼 늘어난다.
+    with st.container(border=True, key="search_box"):
+        left, right = st.columns([3, 2], gap="large")
 
-    with left:
-        st.markdown(
-            '<div class="section-label">1. 질문 선택</div>',
-            unsafe_allow_html=True,
-        )
-        selected_question = st.selectbox(
-            label="질문",
-            options=QUESTION_OPTIONS,
-            label_visibility="collapsed",
-        )
+        with left:
+            st.markdown(
+                '<div class="section-label">1. 질문 선택</div>',
+                unsafe_allow_html=True,
+            )
+            selected_question = st.selectbox(
+                label="질문",
+                options=QUESTION_OPTIONS,
+                label_visibility="collapsed",
+            )
 
-    with right:
-        st.markdown(
-            '<div class="section-label">2. 검색 문서 선택</div>',
-            unsafe_allow_html=True,
-        )
-        selected_document = st.selectbox(
-            label="검색 문서",
-            options=list(DOCUMENT_OPTIONS.keys()),
-            label_visibility="collapsed",
-        )
+        with right:
+            st.markdown(
+                '<div class="section-label">2. 검색 문서 선택</div>',
+                unsafe_allow_html=True,
+            )
+            selected_document = st.selectbox(
+                label="검색 문서",
+                options=list(DOCUMENT_OPTIONS.keys()),
+                label_visibility="collapsed",
+            )
 
-    # 목록에서 고른 질문이 곧 질의다. "직접 질문" 을 골랐을 때만 입력칸을 연다.
-    if selected_question == CUSTOM_QUESTION:
-        st.markdown(
-            '<div class="section-label" style="margin-top:.8rem">'
-            '직접 질문 입력</div>',
-            unsafe_allow_html=True,
-        )
-        question = st.text_input(
-            label="직접 질문",
-            placeholder="예: 대마재배자는 누구에게 허가를 받나요?",
-            label_visibility="collapsed",
-        ).strip()
-    else:
-        question = selected_question
+        # 목록에서 고른 질문이 곧 질의다. "직접 질문" 을 골랐을 때만 입력칸을 연다.
+        if selected_question == CUSTOM_QUESTION:
+            st.markdown(
+                '<div class="section-label" style="margin-top:.8rem">'
+                '직접 질문 입력</div>',
+                unsafe_allow_html=True,
+            )
+            question = st.text_input(
+                label="직접 질문",
+                placeholder="예: 대마재배자는 누구에게 허가를 받나요?",
+                label_visibility="collapsed",
+            ).strip()
+        else:
+            question = selected_question
 
-    st.write("")
-    search_clicked = st.button(
-        "검색",
-        type="primary",
-        use_container_width=True,
-        disabled=not question,
-    )
+        st.write("")
+        search_clicked = st.button(
+            "검색",
+            type="primary",
+            use_container_width=True,
+            disabled=not question,
+        )
 
     if search_clicked:
         doc_key = DOCUMENT_OPTIONS[selected_document]
